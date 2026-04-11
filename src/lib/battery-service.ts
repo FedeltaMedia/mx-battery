@@ -5,6 +5,7 @@ const VENDOR_ID         = 0x046D;
 const PRODUCT_ID        = 0xC548;
 const USAGE_PAGE        = 0xFF00;
 const FEATURE_IDX       = 0x08;    // firmware index of HID++ feature 0x1004 (Unified Battery)
+const QUERY_TIMEOUT_MS  = 2000;    // per-device query timeout
 const POLL_INTERVAL_MS  = 5 * 60 * 1000;
 
 const DEVICE_IDX = {
@@ -25,7 +26,12 @@ type Subscriber = (event: BatteryEvent) => void;
 /** Find the HID path of the Logi Bolt receiver's HID++ management interface. */
 function findDevicePath(): string | undefined {
 	try {
-		return devices(VENDOR_ID, PRODUCT_ID).find(d => d.usagePage === USAGE_PAGE)?.path;
+		const all = devices(VENDOR_ID, PRODUCT_ID);
+		const match = all.find(d => d.usagePage === USAGE_PAGE);
+		if (!match?.path) {
+			logger.warn(`No device found for VID=0x${VENDOR_ID.toString(16)} PID=0x${PRODUCT_ID.toString(16)} usagePage=0x${USAGE_PAGE.toString(16)}. Found: ${JSON.stringify(all.map(d => ({ usagePage: d.usagePage, path: d.path })))}`);
+		}
+		return match?.path;
 	} catch (e) {
 		logger.error(`Device enumeration failed: ${e}`);
 		return undefined;
@@ -34,32 +40,40 @@ function findDevicePath(): string | undefined {
 
 /**
  * Query battery for one device on an already-open HIDAsync handle.
- * Flushes stale data, writes the HID++ request, then waits up to 1500 ms
- * for a matching response.
+ *
+ * Writes the HID++ request then reads in a loop, discarding any unsolicited
+ * reports until a matching response arrives or the timeout elapses.
+ *
+ * This loop is required on Windows where the OS may queue other HID reports
+ * (e.g. device-connection notifications) ahead of our query response.
  */
 async function queryBattery(dev: HIDAsync, deviceIdx: number): Promise<number> {
 	try {
-		// Flush any buffered data left over from previous interactions
-		for (let i = 0; i < 10; i++) {
-			if (await dev.read(5) === undefined) break;
-		}
-
-		// HID++ Unified Battery (feature 0x1004, fn=1): [reportId, deviceIdx, featureIdx, fn<<4|0x01, 0,0,0]
+		// HID++ Unified Battery (feature 0x1004, fn=1 getStatus):
+		// [reportId=0x10, deviceIdx, featureIdx, fn<<4|0x01, 0, 0, 0]
 		await dev.write([0x10, deviceIdx, FEATURE_IDX, 0x11, 0x00, 0x00, 0x00]);
 
-		// Wait for the matching response (response byte layout: [0x11, deviceIdx, featureIdx, 0x11, percent, ...])
-		const response = await dev.read(1500);
-		if (
-			response !== undefined &&
-			response.length > 4 &&
-			response[0] === 0x11 &&
-			response[1] === deviceIdx &&
-			response[2] === FEATURE_IDX
-		) {
-			return response[4];
+		// Read responses in a loop until we find the matching one or time out.
+		// Expected response layout: [0x11, deviceIdx, featureIdx, 0x11, percent, ...]
+		const deadline = Date.now() + QUERY_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const remaining = deadline - Date.now();
+			const data = await dev.read(Math.min(remaining, 300));
+
+			if (data === undefined) break; // timed out waiting for any data
+
+			if (
+				data.length > 4 &&
+				data[0] === 0x11 &&
+				data[1] === deviceIdx &&
+				data[2] === FEATURE_IDX
+			) {
+				return data[4];
+			}
+			// Otherwise it was an unsolicited report — keep reading.
 		}
 
-		logger.warn(`No matching response for device_idx=0x${deviceIdx.toString(16).padStart(2, "0")}`);
+		logger.warn(`No matching response for device_idx=0x${deviceIdx.toString(16).padStart(2, "0")} within ${QUERY_TIMEOUT_MS} ms`);
 		return -1;
 	} catch (e) {
 		logger.error(`Query error for device_idx=0x${deviceIdx.toString(16).padStart(2, "0")}: ${e}`);
@@ -69,25 +83,26 @@ async function queryBattery(dev: HIDAsync, deviceIdx: number): Promise<number> {
 
 /**
  * Open the Logi Bolt HID++ interface once, query both devices sequentially, close.
+ * Opens non-exclusively so other software (e.g. Logi Options+) can coexist.
  */
 async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
 	const path = findDevicePath();
 	if (!path) {
-		logger.warn("Logi Bolt receiver not found (VID=0x046D PID=0xC548 usagePage=0xFF00)");
 		return { mouse: -1, keyboard: -1 };
 	}
 
 	let dev: HIDAsync;
 	try {
-		dev = await HIDAsync.open(path);
+		dev = await HIDAsync.open(path, { nonExclusive: true });
 	} catch (e) {
-		logger.error(`Failed to open HID device: ${e}`);
+		logger.error(`Failed to open HID device at ${path}: ${e}`);
 		return { mouse: -1, keyboard: -1 };
 	}
 
 	try {
 		const mouse    = await queryBattery(dev, DEVICE_IDX.mouse);
 		const keyboard = await queryBattery(dev, DEVICE_IDX.keyboard);
+		logger.info(`Poll result — mouse: ${mouse}%, keyboard: ${keyboard}%`);
 		return { mouse, keyboard };
 	} finally {
 		await dev.close().catch(() => {});
@@ -107,8 +122,8 @@ class BatteryService {
 	/**
 	 * Register a subscriber. Returns an unsubscribe function.
 	 *
+	 * - Emits cached values to the new subscriber immediately.
 	 * - If this is the first subscriber, starts the poll timer and fires immediately.
-	 * - If cached values are available, emits them to the new subscriber right away.
 	 * - Poll timer stops automatically when the last subscriber unsubscribes.
 	 */
 	subscribe(fn: Subscriber): () => void {
