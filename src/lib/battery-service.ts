@@ -24,115 +24,110 @@ export type BatteryEvent =
 type Subscriber = (event: BatteryEvent) => void;
 
 /**
- * Find the HID path for the Logi Bolt HID++ management interface.
+ * Return ALL HID paths for the Logi Bolt management interface.
  *
- * Primary: match by usage_page=0xFF00 (works on macOS, works on Windows when populated).
- * Fallback: on Windows, usage_page may be 0 for vendor-specific interfaces.
- *           The HID++ management interface is always interface number 2 on Logi Bolt.
+ * On macOS there is one path.
+ * On Windows the HID driver exposes two separate collections per interface:
+ *   MI_02&Col01 — output (we write commands here)
+ *   MI_02&Col02 — input  (responses arrive here)
+ * We must open both and read from all of them.
  */
-function findDevicePath(): string | undefined {
-	let all: ReturnType<typeof devices>;
+function findDevicePaths(): string[] {
 	try {
-		all = devices(VENDOR_ID, PRODUCT_ID);
+		const all = devices(VENDOR_ID, PRODUCT_ID);
+
+		// Primary: all paths with usagePage=0xFF00
+		const byUsage = all.filter(d => d.usagePage === USAGE_PAGE && d.path).map(d => d.path!);
+		if (byUsage.length > 0) return byUsage;
+
+		// Fallback: all paths on interface 2 (usagePage not populated on some Windows configs)
+		const byIface = all.filter(d => d.interface === 2 && d.path).map(d => d.path!);
+		if (byIface.length > 0) {
+			logger.warn("usagePage filter empty — falling back to interface 2 paths");
+			return byIface;
+		}
+
+		logger.error("Logi Bolt receiver not found");
+		return [];
 	} catch (e) {
-		console.error(`[MXBattery] devices() threw: ${e}`);
-		return undefined;
+		logger.error(`Device enumeration failed: ${e}`);
+		return [];
 	}
-
-	console.log(`[MXBattery] Enumerated ${all.length} device(s) for VID=0x${VENDOR_ID.toString(16)} PID=0x${PRODUCT_ID.toString(16)}:`);
-	for (const d of all) {
-		console.log(`  path=${d.path}  usagePage=0x${(d.usagePage ?? 0).toString(16)}  interface=${d.interface}`);
-	}
-
-	// Primary: usage page filter
-	const byUsage = all.find(d => d.usagePage === USAGE_PAGE && d.path);
-	if (byUsage?.path) {
-		console.log(`[MXBattery] Using device (usagePage match): ${byUsage.path}`);
-		return byUsage.path;
-	}
-
-	// Fallback: interface 2 (HID++ management endpoint on all Logi Bolt receivers)
-	const byIface = all.find(d => d.interface === 2 && d.path);
-	if (byIface?.path) {
-		console.warn(`[MXBattery] usagePage filter found nothing — falling back to interface 2: ${byIface.path}`);
-		return byIface.path;
-	}
-
-	console.error(`[MXBattery] No usable interface found. Is the Logi Bolt receiver plugged in?`);
-	return undefined;
 }
 
 /**
- * Query battery for one device on an already-open HIDAsync handle.
+ * Query battery for one device.
  *
- * Writes the HID++ request then reads in a loop, discarding unrelated reports
- * until a matching response arrives or the timeout elapses.
- *
- * Response filter accepts report ID 0x10 (short) AND 0x11 (long) because the
- * firmware may use either format depending on platform/firmware version.
+ * @param writeDev  The device handle to send the command on (Col01 / only path on macOS).
+ * @param readDevs  ALL open device handles to read from. On Windows, Col02 carries the
+ *                  response while Col01 returns empty reads — so we race them all.
  */
-async function queryBattery(dev: HIDAsync, deviceIdx: number): Promise<number> {
+async function queryBattery(
+	writeDev: HIDAsync,
+	readDevs: HIDAsync[],
+	deviceIdx: number,
+): Promise<number> {
 	const label = `device_idx=0x${deviceIdx.toString(16).padStart(2, "0")}`;
 	try {
-		const msg = [0x10, deviceIdx, FEATURE_IDX, 0x11, 0x00, 0x00, 0x00];
-		console.log(`[MXBattery] write ${label}: ${msg.map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ")}`);
-		await dev.write(msg);
+		await writeDev.write([0x10, deviceIdx, FEATURE_IDX, 0x11, 0x00, 0x00, 0x00]);
+		logger.info(`Sent query for ${label}`);
 
 		const deadline = Date.now() + QUERY_TIMEOUT_MS;
 		while (Date.now() < deadline) {
-			const remaining = deadline - Date.now();
-			const data = await dev.read(Math.min(remaining, 300));
+			const remaining = Math.min(deadline - Date.now(), 300);
+			if (remaining <= 0) break;
 
-			if (data === undefined) {
-				console.warn(`[MXBattery] read timed out for ${label}`);
-				break;
+			// Read from ALL open paths in parallel — on Windows the matching response
+			// arrives on Col02, not Col01, so we must check every path.
+			const results = await Promise.all(readDevs.map(dev => dev.read(remaining)));
+
+			for (const data of results) {
+				if (
+					data !== undefined &&
+					data.length > 4 &&
+					(data[0] === 0x10 || data[0] === 0x11) &&
+					data[1] === deviceIdx &&
+					data[2] === FEATURE_IDX
+				) {
+					logger.info(`${label} → ${data[4]}%`);
+					return data[4];
+				}
 			}
-
-			const hex = Array.from(data).slice(0, 8).map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ");
-			console.log(`[MXBattery] read ${label}: [${hex}]`);
-
-			// Accept both 0x10 (short HID++) and 0x11 (long HID++) response formats.
-			// The firmware may use either depending on platform.
-			if (
-				data.length > 4 &&
-				(data[0] === 0x10 || data[0] === 0x11) &&
-				data[1] === deviceIdx &&
-				data[2] === FEATURE_IDX
-			) {
-				console.log(`[MXBattery] matched response for ${label}: ${data[4]}%`);
-				return data[4];
-			}
-			// Unrelated report — keep reading.
 		}
 
-		console.warn(`[MXBattery] no matching response for ${label} within ${QUERY_TIMEOUT_MS} ms`);
+		logger.warn(`No response for ${label} within ${QUERY_TIMEOUT_MS} ms`);
 		return -1;
 	} catch (e) {
-		console.error(`[MXBattery] exception for ${label}: ${e}`);
+		logger.error(`Query error for ${label}: ${e}`);
 		return -1;
 	}
 }
 
 async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
-	const path = findDevicePath();
-	if (!path) return { mouse: -1, keyboard: -1 };
+	const paths = findDevicePaths();
+	if (paths.length === 0) return { mouse: -1, keyboard: -1 };
 
-	let dev: HIDAsync;
-	try {
-		dev = await HIDAsync.open(path, { nonExclusive: true });
-		console.log(`[MXBattery] opened: ${path}`);
-	} catch (e) {
-		console.error(`[MXBattery] open failed for ${path}: ${e}`);
-		return { mouse: -1, keyboard: -1 };
+	// Open every matching path (Col01 + Col02 on Windows, single path on macOS)
+	const opened: HIDAsync[] = [];
+	for (const path of paths) {
+		try {
+			opened.push(await HIDAsync.open(path, { nonExclusive: true }));
+		} catch (e) {
+			logger.error(`Cannot open ${path}: ${e}`);
+		}
 	}
 
+	if (opened.length === 0) return { mouse: -1, keyboard: -1 };
+
+	// Always write to the first path (Col01 / the macOS path)
+	const writeDev = opened[0];
+
 	try {
-		const mouse    = await queryBattery(dev, DEVICE_IDX.mouse);
-		const keyboard = await queryBattery(dev, DEVICE_IDX.keyboard);
-		console.log(`[MXBattery] poll result — mouse: ${mouse}%, keyboard: ${keyboard}%`);
+		const mouse    = await queryBattery(writeDev, opened, DEVICE_IDX.mouse);
+		const keyboard = await queryBattery(writeDev, opened, DEVICE_IDX.keyboard);
 		return { mouse, keyboard };
 	} finally {
-		await dev.close().catch(() => {});
+		for (const dev of opened) await dev.close().catch(() => {});
 	}
 }
 
