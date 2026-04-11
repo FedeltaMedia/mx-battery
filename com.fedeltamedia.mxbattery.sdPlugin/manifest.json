@@ -1,0 +1,56 @@
+{
+	"Name": "MX Battery",
+	"Version": "1.0.0.0",
+	"Author": "FedeltaMedia",
+	"Actions": [
+		{
+			"Name": "MX Master 3S Battery",
+			"UUID": "com.fedeltamedia.mxbattery.mouse",
+			"Icon": "imgs/actions/mouse/icon",
+			"Tooltip": "Displays the battery percentage of the Logitech MX Master 3S mouse.",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/mouse/icon",
+					"TitleAlignment": "middle"
+				}
+			]
+		},
+		{
+			"Name": "MX Keys S Battery",
+			"UUID": "com.fedeltamedia.mxbattery.keyboard",
+			"Icon": "imgs/actions/keyboard/icon",
+			"Tooltip": "Displays the battery percentage of the Logitech MX Keys S keyboard.",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/keyboard/icon",
+					"TitleAlignment": "middle"
+				}
+			]
+		}
+	],
+	"Category": "MX Battery",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Displays the battery percentage of the Logitech MX Master 3S mouse and MX Keys S keyboard connected via a Logi Bolt receiver.",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 3,
+	"Software": {
+		"MinimumVersion": "6.9"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "12"
+		}
+	],
+	"Nodejs": {
+		"Version": "20"
+	},
+	"UUID": "com.fedeltamedia.mxbattery"
+}
