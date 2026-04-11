@@ -20,6 +20,9 @@ const config = {
 			return url.pathToFileURL(path.resolve(path.dirname(sourcemapPath), relativeSourcePath)).href;
 		}
 	},
+	// node-hid is a native addon — keep it external so rollup doesn't try to bundle it.
+	// It must be present in the plugin's node_modules at runtime (handled by copy-deps).
+	external: ["node-hid"],
 	plugins: [
 		{
 			name: "watch-externals",

@@ -3,3 +3,4 @@ node_modules/
 com.fedeltamedia.mxbattery.sdPlugin/bin/plugin.js
 com.fedeltamedia.mxbattery.sdPlugin/bin/plugin.js.map
 com.fedeltamedia.mxbattery.sdPlugin/bin/package.json
+com.fedeltamedia.mxbattery.sdPlugin/node_modules/

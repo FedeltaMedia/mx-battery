@@ -1,10 +1,11 @@
 {
     "name": "mx-battery",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Stream Deck plugin showing battery percentage for Logitech MX Master 3S and MX Keys S",
     "scripts": {
         "build": "rollup -c",
-        "pack": "npm run build && streamdeck pack com.fedeltamedia.mxbattery.sdPlugin --output . -f",
+        "copy-deps": "node scripts/copy-deps.cjs",
+        "pack": "npm run build && npm run copy-deps && streamdeck pack com.fedeltamedia.mxbattery.sdPlugin --output . -f",
         "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart com.fedeltamedia.mxbattery\""
     },
     "type": "module",
@@ -21,6 +22,7 @@
         "typescript": "5.9.3"
     },
     "dependencies": {
-        "@elgato/streamdeck": "^2.0.4"
+        "@elgato/streamdeck": "^2.0.4",
+        "node-hid": "^3.3.0"
     }
 }

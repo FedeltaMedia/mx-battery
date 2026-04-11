@@ -1,6 +1,6 @@
 {
 	"Name": "MX Battery",
-	"Version": "1.0.0.0",
+	"Version": "1.0.1.0",
 	"Author": "FedeltaMedia",
 	"Actions": [
 		{
@@ -47,6 +47,10 @@
 		{
 			"Platform": "mac",
 			"MinimumVersion": "12"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
 		}
 	],
 	"Nodejs": {

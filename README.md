@@ -2,8 +2,6 @@
 
 Displays the battery percentage of a **Logitech MX Master 3S** mouse and **MX Keys S** keyboard connected via a **Logi Bolt** USB receiver directly on your Stream Deck keys.
 
-![Plugin preview](com.fedeltamedia.mxbattery.sdPlugin/imgs/plugin/marketplace.png)
-
 ## Features
 
 - Two actions: **MX Master 3S Battery** and **MX Keys S Battery**
@@ -13,7 +11,7 @@ Displays the battery percentage of a **Logitech MX Master 3S** mouse and **MX Ke
   - 🔴 Red — below 20 %
 - Polls every **5 minutes** automatically
 - Press the key to **force an immediate refresh**
-- macOS only (Mac Mini M1 / Apple Silicon supported)
+- Works on **macOS** and **Windows** — no Python, no drivers, no configuration
 
 ## Requirements
 
@@ -21,15 +19,10 @@ Displays the battery percentage of a **Logitech MX Master 3S** mouse and **MX Ke
 |---|---|
 | Stream Deck software | 6.9 or later |
 | macOS | 12 (Monterey) or later |
-| Python | 3.10 at `/usr/local/bin/python3` |
-| hidapi Python binding | `pip3 install hidapi` |
+| Windows | 10 or later |
 | Logi Bolt receiver | USB vendor `0x046D`, product `0xC548` |
 
-### Install hidapi
-
-```bash
-pip3 install hidapi
-```
+The plugin communicates with the receiver via native HID using **node-hid**, which ships prebuilt binaries for all supported platforms inside the package. No Python, no additional drivers, and no `npm install` required on the end-user's machine.
 
 ## Installation
 
@@ -39,10 +32,10 @@ pip3 install hidapi
 
 ## How it works
 
-The plugin calls a bundled Python helper (`bin/battery.py`) via `child_process.execFile`. The helper communicates with the Logi Bolt receiver using the **HID++ protocol**:
+The plugin uses **node-hid** to talk to the Logi Bolt receiver directly from Node.js (the runtime bundled with Stream Deck). It uses the **HID++ protocol**:
 
 - Opens the HID device at `vendor=0x046D`, `product=0xC548`, `usage_page=0xFF00`
-- Queries **Unified Battery** feature (HID++ feature `0x1004`, firmware index `0x08`)
+- Queries the **Unified Battery** feature (HID++ feature `0x1004`, firmware index `0x08`)
 - `device_idx 0x02` → MX Master 3S mouse
 - `device_idx 0x01` → MX Keys S keyboard
 - Response byte 4 contains the battery percentage
@@ -53,9 +46,9 @@ The plugin calls a bundled Python helper (`bin/battery.py`) via `child_process.e
 git clone https://github.com/FedeltaMedia/mx-battery.git
 cd mx-battery
 npm install
-npm run build   # compiles TypeScript → com.fedeltamedia.mxbattery.sdPlugin/bin/plugin.js
-npm run pack    # builds + creates .streamDeckPlugin release file
-npm run watch   # live-reload during development (requires Stream Deck app)
+npm run build     # compiles TypeScript → com.fedeltamedia.mxbattery.sdPlugin/bin/plugin.js
+npm run pack      # builds + copies deps + creates .streamDeckPlugin release file
+npm run watch     # live-reload during development (requires Stream Deck app running)
 ```
 
 ## License
