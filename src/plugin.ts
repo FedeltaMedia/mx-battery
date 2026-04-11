@@ -43,34 +43,58 @@ try {
 		}
 	}
 
-	// Try opening the management interface and querying the mouse
-	const mgmt = devs.find(d => d.usagePage === 0xFF00) ?? devs.find(d => d.interface === 2);
-	if (mgmt?.path) {
-		log(`open test     : trying ${mgmt.path}`);
-		try {
-			const dev = await hid.HIDAsync.open(mgmt.path, { nonExclusive: true });
-			log("open test     : opened OK");
+	// Try opening the management interface — open ALL matching paths (Col01+Col02 on Windows)
+	const allMgmt = devs.filter(d => d.usagePage === 0xFF00 && d.path);
+	if (allMgmt.length === 0) {
+		const fallback = devs.filter(d => d.interface === 2 && d.path);
+		fallback.forEach(d => allMgmt.push(d));
+	}
 
-			await dev.write([0x10, 0x02, 0x08, 0x11, 0x00, 0x00, 0x00]);
-			log("write test    : sent mouse battery query");
+	if (allMgmt.length > 0) {
+		const opened: Awaited<ReturnType<typeof hid.HIDAsync.open>>[] = [];
+		for (const d of allMgmt) {
+			try {
+				log(`open test     : trying ${d.path}`);
+				opened.push(await hid.HIDAsync.open(d.path!, { nonExclusive: true }));
+				log(`open test     : opened OK`);
+			} catch (e) {
+				log(`open test ERR : ${e}`);
+			}
+		}
 
-			const deadline = Date.now() + 2000;
-			let got = false;
-			while (Date.now() < deadline) {
-				const data = await dev.read(300);
-				if (!data) break;
-				const hex = Array.from(data).slice(0, 8).map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ");
-				log(`read          : [${hex}]`);
-				if (data.length > 4 && (data[0] === 0x10 || data[0] === 0x11) && data[1] === 0x02 && data[2] === 0x08) {
-					log(`RESULT        : mouse battery = ${data[4]}%  ✓`);
-					got = true;
-					break;
+		if (opened.length > 0) {
+			const writeDev = opened[0];
+
+			// Query device index 0x01 and 0x02 — log raw bytes to identify which is mouse/keyboard
+			for (const deviceIdx of [0x01, 0x02]) {
+				const label = `device_idx=0x${deviceIdx.toString(16).padStart(2,"0")}`;
+				try {
+					await writeDev.write([0x10, deviceIdx, 0x08, 0x11, 0x00, 0x00, 0x00]);
+					log(`write test    : sent query for ${label}`);
+
+					const deadline = Date.now() + 2000;
+					let got = false;
+					while (Date.now() < deadline) {
+						const results = await Promise.all(opened.map(dev => dev.read(300)));
+						for (const data of results) {
+							if (!data || data.length === 0) continue;
+							const hex = Array.from(data).slice(0, 8).map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ");
+							log(`read          : [${hex}]`);
+							if (data.length > 4 && (data[0] === 0x10 || data[0] === 0x11)) {
+								log(`RESULT        : ${label} → reported device_idx=0x${data[1].toString(16).padStart(2,"0")}  feature=0x${data[2].toString(16).padStart(2,"0")}  battery=${data[4]}%`);
+								got = true;
+								break;
+							}
+						}
+						if (got) break;
+					}
+					if (!got) log(`read timeout  : no response for ${label} within 2 s`);
+				} catch (e) {
+					log(`query ERR ${label}:`, String(e));
 				}
 			}
-			if (!got) log("read timeout  : no matching response within 2 s");
-			await dev.close();
-		} catch (e) {
-			log("open/query ERR:", String(e));
+
+			for (const dev of opened) await dev.close().catch(() => {});
 		}
 	} else {
 		log("open test     : skipped — no usagePage/interface-2 match");
