@@ -8,10 +8,17 @@ const FEATURE_IDX       = 0x08;    // firmware index of HID++ feature 0x1004 (Un
 const QUERY_TIMEOUT_MS  = 2000;
 const POLL_INTERVAL_MS  = 5 * 60 * 1000;
 
+/** Default indices (macOS pairing order). Overridden at runtime by discoverDeviceIndices(). */
 const DEVICE_IDX = {
 	mouse:    0x02,   // MX Master 3S
 	keyboard: 0x01,   // MX Keys S
 } as const;
+
+/** SmartShift wheel feature — present on MX Master mice, never on keyboards. */
+const SMART_SHIFT_FEATURE = 0x2100;
+
+/** Cached result of device-index discovery; refreshed each plugin session. */
+let cachedDeviceIdx: { mouse: number; keyboard: number } | null = null;
 
 const logger = streamDeck.logger.createScope("BatteryService");
 
@@ -103,6 +110,68 @@ async function queryBattery(
 	}
 }
 
+/**
+ * Ask the HID++ Root feature (index 0x00) for the feature-table index of a
+ * given feature code.  Returns 0 if the feature is not present on that device.
+ */
+async function queryFeatureIndex(
+	writeDev: HIDAsync,
+	readDevs: HIDAsync[],
+	deviceIdx: number,
+	featureCode: number,
+): Promise<number> {
+	const hi = (featureCode >> 8) & 0xFF;
+	const lo = featureCode & 0xFF;
+	try {
+		await writeDev.write([0x10, deviceIdx, 0x00, 0x01, hi, lo, 0x00]);
+		const deadline = Date.now() + QUERY_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const remaining = Math.min(deadline - Date.now(), 300);
+			if (remaining <= 0) break;
+			const results = await Promise.all(readDevs.map(dev => dev.read(remaining)));
+			for (const data of results) {
+				if (
+					data !== undefined &&
+					data.length > 4 &&
+					(data[0] === 0x10 || data[0] === 0x11) &&
+					data[1] === deviceIdx &&
+					data[2] === 0x00
+				) {
+					return data[4];
+				}
+			}
+		}
+	} catch (e) {
+		logger.error(`queryFeatureIndex(0x${deviceIdx.toString(16)}, 0x${featureCode.toString(16)}): ${e}`);
+	}
+	return 0;
+}
+
+/**
+ * Dynamically discover which Logi Bolt device slot is the mouse and which is
+ * the keyboard by probing for the SmartShift (0x2100) feature — present only
+ * on MX Master mice.  Falls back to hardcoded defaults if detection fails.
+ */
+async function discoverDeviceIndices(
+	writeDev: HIDAsync,
+	readDevs: HIDAsync[],
+): Promise<{ mouse: number; keyboard: number }> {
+	try {
+		for (const idx of [0x01, 0x02]) {
+			const featIdx = await queryFeatureIndex(writeDev, readDevs, idx, SMART_SHIFT_FEATURE);
+			if (featIdx > 0) {
+				const other = idx === 0x01 ? 0x02 : 0x01;
+				logger.info(`Discovered: mouse=0x${idx.toString(16)}, keyboard=0x${other.toString(16)}`);
+				return { mouse: idx, keyboard: other };
+			}
+		}
+	} catch (e) {
+		logger.error(`Device discovery error: ${e}`);
+	}
+	logger.warn("Could not auto-detect device indices — using defaults (mouse=0x02, keyboard=0x01)");
+	return { ...DEVICE_IDX };
+}
+
 async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
 	const paths = findDevicePaths();
 	if (paths.length === 0) return { mouse: -1, keyboard: -1 };
@@ -123,8 +192,11 @@ async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
 	const writeDev = opened[0];
 
 	try {
-		const mouse    = await queryBattery(writeDev, opened, DEVICE_IDX.mouse);
-		const keyboard = await queryBattery(writeDev, opened, DEVICE_IDX.keyboard);
+		if (!cachedDeviceIdx) {
+			cachedDeviceIdx = await discoverDeviceIndices(writeDev, opened);
+		}
+		const mouse    = await queryBattery(writeDev, opened, cachedDeviceIdx.mouse);
+		const keyboard = await queryBattery(writeDev, opened, cachedDeviceIdx.keyboard);
 		return { mouse, keyboard };
 	} finally {
 		for (const dev of opened) await dev.close().catch(() => {});

@@ -1,6 +1,6 @@
 {
     "name": "mx-battery",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "description": "Stream Deck plugin showing battery percentage for Logitech MX Master 3S and MX Keys S",
     "scripts": {
         "build": "rollup -c",
