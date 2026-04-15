@@ -97,8 +97,16 @@ try {
 
 			// ── Root.getFeature probes: discover feature table indices ──
 			log("--- Root.getFeature probes ---");
+			const probeFeatures: [string, number][] = [
+				["UnifiedBattery", 0x1004],
+				["SmartShift",     0x2100],
+				["SmartShiftEnh",  0x2111],
+				["ThumbWheel",     0x2150],
+				["HiResScroll",    0x2200],
+				["HiResScrollV2",  0x2201],
+			];
 			for (const deviceIdx of [0x01, 0x02]) {
-				for (const [name, featureCode] of [["SmartShift", 0x2100], ["UnifiedBattery", 0x1004]] as [string, number][]) {
+				for (const [name, featureCode] of probeFeatures) {
 					const hi = (featureCode >> 8) & 0xFF;
 					const lo = featureCode & 0xFF;
 					try {

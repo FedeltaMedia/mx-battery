@@ -5,8 +5,19 @@ const VENDOR_ID              = 0x046D;
 const PRODUCT_ID             = 0xC548;
 const USAGE_PAGE             = 0xFF00;
 const UNIFIED_BATTERY_FEATURE = 0x1004;   // HID++ feature code: Unified Battery Status
-const SMART_SHIFT_FEATURE    = 0x2100;    // HID++ feature code: SmartShift (mouse only)
 const FALLBACK_FEATURE_IDX   = 0x08;      // Fallback UnifiedBattery table index
+
+/**
+ * Mouse-exclusive HID++ feature codes, tried in order until one is found on a slot.
+ * The first slot to have ANY of these is the mouse; the other is the keyboard.
+ *
+ *   0x2100 — SmartShift (original, older firmware)
+ *   0x2111 — SmartShift Enhanced (MX Master 3S and newer mice)
+ *   0x2150 — ThumbWheel (MX Master side scroll wheel)
+ *   0x2200 — HiRes Vertical Scrolling
+ *   0x2201 — HiRes Vertical Scrolling v2
+ */
+const MOUSE_FEATURES = [0x2100, 0x2111, 0x2150, 0x2200, 0x2201] as const;
 const QUERY_TIMEOUT_MS       = 2000;
 const POLL_INTERVAL_MS       = 5 * 60 * 1000;
 
@@ -124,22 +135,25 @@ async function discoverDevices(
 		slotFeatureIdx[idx] = fi > 0 ? fi : FALLBACK_FEATURE_IDX;
 	}
 
-	// Step 2 — identify mouse by SmartShift presence
+	// Step 2 — identify mouse by finding any mouse-exclusive feature
 	for (const idx of [0x01, 0x02]) {
-		const ssIdx = await queryFeatureIndex(writeDev, readDevs, idx, SMART_SHIFT_FEATURE);
-		if (ssIdx > 0) {
-			const other = idx === 0x01 ? 0x02 : 0x01;
-			const mouse:    DeviceConfig = { idx,   featureIdx: slotFeatureIdx[idx] };
-			const keyboard: DeviceConfig = { idx: other, featureIdx: slotFeatureIdx[other] };
-			logger.info(
-				`Discovered: mouse=slot 0x${idx.toString(16)} (battFeat=0x${mouse.featureIdx.toString(16)}), ` +
-				`keyboard=slot 0x${other.toString(16)} (battFeat=0x${keyboard.featureIdx.toString(16)})`,
-			);
-			return { mouse, keyboard };
+		for (const featureCode of MOUSE_FEATURES) {
+			const fi = await queryFeatureIndex(writeDev, readDevs, idx, featureCode);
+			if (fi > 0) {
+				const other = idx === 0x01 ? 0x02 : 0x01;
+				const mouse:    DeviceConfig = { idx,   featureIdx: slotFeatureIdx[idx] };
+				const keyboard: DeviceConfig = { idx: other, featureIdx: slotFeatureIdx[other] };
+				logger.info(
+					`Identified mouse at slot 0x${idx.toString(16)} via feature 0x${featureCode.toString(16).padStart(4, "0")} ` +
+					`(battFeat=0x${mouse.featureIdx.toString(16)}), ` +
+					`keyboard at slot 0x${other.toString(16)} (battFeat=0x${keyboard.featureIdx.toString(16)})`,
+				);
+				return { mouse, keyboard };
+			}
 		}
 	}
 
-	logger.warn("SmartShift not found on any slot — using defaults (mouse=0x02 feat=0x08, keyboard=0x01 feat=0x08)");
+	logger.warn("No mouse-exclusive feature found on any slot — using defaults (mouse=0x02 feat=0x08, keyboard=0x01 feat=0x08)");
 	return {
 		mouse:    { idx: 0x02, featureIdx: FALLBACK_FEATURE_IDX },
 		keyboard: { idx: 0x01, featureIdx: FALLBACK_FEATURE_IDX },
