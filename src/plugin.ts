@@ -65,32 +65,63 @@ try {
 		if (opened.length > 0) {
 			const writeDev = opened[0];
 
-			// Query device index 0x01 and 0x02 — log raw bytes to identify which is mouse/keyboard
+			// ── Battery query: read UnifiedBattery at feature index 0x08 for each slot ──
 			for (const deviceIdx of [0x01, 0x02]) {
 				const label = `device_idx=0x${deviceIdx.toString(16).padStart(2,"0")}`;
 				try {
 					await writeDev.write([0x10, deviceIdx, 0x08, 0x11, 0x00, 0x00, 0x00]);
-					log(`write test    : sent query for ${label}`);
+					log(`write test    : sent battery query for ${label}`);
 
 					const deadline = Date.now() + 2000;
 					let got = false;
-					while (Date.now() < deadline) {
+					while (Date.now() < deadline && !got) {
 						const results = await Promise.all(opened.map(dev => dev.read(300)));
 						for (const data of results) {
 							if (!data || data.length === 0) continue;
 							const hex = Array.from(data).slice(0, 8).map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ");
 							log(`read          : [${hex}]`);
-							if (data.length > 4 && (data[0] === 0x10 || data[0] === 0x11)) {
-								log(`RESULT        : ${label} → reported device_idx=0x${data[1].toString(16).padStart(2,"0")}  feature=0x${data[2].toString(16).padStart(2,"0")}  battery=${data[4]}%`);
+							// Only accept a matching response (correct device + feature 0x08)
+							if (data.length > 4 && (data[0] === 0x10 || data[0] === 0x11) &&
+								data[1] === deviceIdx && data[2] === 0x08) {
+								log(`BATTERY       : ${label} → ${data[4]}%`);
 								got = true;
 								break;
 							}
 						}
-						if (got) break;
 					}
-					if (!got) log(`read timeout  : no response for ${label} within 2 s`);
+					if (!got) log(`BATTERY       : ${label} → timeout / no matching response`);
 				} catch (e) {
 					log(`query ERR ${label}:`, String(e));
+				}
+			}
+
+			// ── Root.getFeature probes: discover feature table indices ──
+			log("--- Root.getFeature probes ---");
+			for (const deviceIdx of [0x01, 0x02]) {
+				for (const [name, featureCode] of [["SmartShift", 0x2100], ["UnifiedBattery", 0x1004]] as [string, number][]) {
+					const hi = (featureCode >> 8) & 0xFF;
+					const lo = featureCode & 0xFF;
+					try {
+						await writeDev.write([0x10, deviceIdx, 0x00, 0x01, hi, lo, 0x00]);
+						const deadline = Date.now() + 2000;
+						let got = false;
+						while (Date.now() < deadline && !got) {
+							const results = await Promise.all(opened.map(dev => dev.read(300)));
+							for (const data of results) {
+								if (!data || data.length < 5) continue;
+								if ((data[0] === 0x10 || data[0] === 0x11) &&
+									data[1] === deviceIdx && data[2] === 0x00) {
+									const hex = Array.from(data).slice(0, 8).map(b => `0x${b.toString(16).padStart(2,"0")}`).join(" ");
+									log(`Root.getFeature: device=0x${deviceIdx.toString(16).padStart(2,"0")} ${name}(0x${featureCode.toString(16).padStart(4,"0")}) → tableIdx=0x${data[4].toString(16)} raw=[${hex}]`);
+									got = true;
+									break;
+								}
+							}
+						}
+						if (!got) log(`Root.getFeature: device=0x${deviceIdx.toString(16).padStart(2,"0")} ${name}(0x${featureCode.toString(16).padStart(4,"0")}) → timeout`);
+					} catch (e) {
+						log(`Root.getFeature ERR: ${e}`);
+					}
 				}
 			}
 

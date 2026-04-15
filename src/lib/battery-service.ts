@@ -1,24 +1,26 @@
 import { HIDAsync, devices } from "node-hid";
 import streamDeck from "@elgato/streamdeck";
 
-const VENDOR_ID         = 0x046D;
-const PRODUCT_ID        = 0xC548;
-const USAGE_PAGE        = 0xFF00;
-const FEATURE_IDX       = 0x08;    // firmware index of HID++ feature 0x1004 (Unified Battery)
-const QUERY_TIMEOUT_MS  = 2000;
-const POLL_INTERVAL_MS  = 5 * 60 * 1000;
+const VENDOR_ID              = 0x046D;
+const PRODUCT_ID             = 0xC548;
+const USAGE_PAGE             = 0xFF00;
+const UNIFIED_BATTERY_FEATURE = 0x1004;   // HID++ feature code: Unified Battery Status
+const SMART_SHIFT_FEATURE    = 0x2100;    // HID++ feature code: SmartShift (mouse only)
+const FALLBACK_FEATURE_IDX   = 0x08;      // Fallback UnifiedBattery table index
+const QUERY_TIMEOUT_MS       = 2000;
+const POLL_INTERVAL_MS       = 5 * 60 * 1000;
 
-/** Default indices (macOS pairing order). Overridden at runtime by discoverDeviceIndices(). */
-const DEVICE_IDX = {
-	mouse:    0x02,   // MX Master 3S
-	keyboard: 0x01,   // MX Keys S
-} as const;
+/** Per-device resolved configuration. */
+interface DeviceConfig {
+	idx:        number;   // Logi Bolt slot index (0x01 or 0x02)
+	featureIdx: number;   // Feature table index for UnifiedBattery on this device
+}
 
-/** SmartShift wheel feature — present on MX Master mice, never on keyboards. */
-const SMART_SHIFT_FEATURE = 0x2100;
-
-/** Cached result of device-index discovery; refreshed each plugin session. */
-let cachedDeviceIdx: { mouse: number; keyboard: number } | null = null;
+/**
+ * Cached discovery result.  Populated on first poll; lives for the plugin session.
+ * Reset to null on startup so it re-discovers after a Stream Deck restart.
+ */
+let cachedDevices: { mouse: DeviceConfig; keyboard: DeviceConfig } | null = null;
 
 const logger = streamDeck.logger.createScope("BatteryService");
 
@@ -63,56 +65,8 @@ function findDevicePaths(): string[] {
 }
 
 /**
- * Query battery for one device.
- *
- * @param writeDev  The device handle to send the command on (Col01 / only path on macOS).
- * @param readDevs  ALL open device handles to read from. On Windows, Col02 carries the
- *                  response while Col01 returns empty reads — so we race them all.
- */
-async function queryBattery(
-	writeDev: HIDAsync,
-	readDevs: HIDAsync[],
-	deviceIdx: number,
-): Promise<number> {
-	const label = `device_idx=0x${deviceIdx.toString(16).padStart(2, "0")}`;
-	try {
-		await writeDev.write([0x10, deviceIdx, FEATURE_IDX, 0x11, 0x00, 0x00, 0x00]);
-		logger.info(`Sent query for ${label}`);
-
-		const deadline = Date.now() + QUERY_TIMEOUT_MS;
-		while (Date.now() < deadline) {
-			const remaining = Math.min(deadline - Date.now(), 300);
-			if (remaining <= 0) break;
-
-			// Read from ALL open paths in parallel — on Windows the matching response
-			// arrives on Col02, not Col01, so we must check every path.
-			const results = await Promise.all(readDevs.map(dev => dev.read(remaining)));
-
-			for (const data of results) {
-				if (
-					data !== undefined &&
-					data.length > 4 &&
-					(data[0] === 0x10 || data[0] === 0x11) &&
-					data[1] === deviceIdx &&
-					data[2] === FEATURE_IDX
-				) {
-					logger.info(`${label} → ${data[4]}%`);
-					return data[4];
-				}
-			}
-		}
-
-		logger.warn(`No response for ${label} within ${QUERY_TIMEOUT_MS} ms`);
-		return -1;
-	} catch (e) {
-		logger.error(`Query error for ${label}: ${e}`);
-		return -1;
-	}
-}
-
-/**
- * Ask the HID++ Root feature (index 0x00) for the feature-table index of a
- * given feature code.  Returns 0 if the feature is not present on that device.
+ * Ask the HID++ Root feature (always at table index 0x00) for the feature-table
+ * index of a given HID++ feature code.  Returns 0 if not present or on timeout.
  */
 async function queryFeatureIndex(
 	writeDev: HIDAsync,
@@ -120,6 +74,7 @@ async function queryFeatureIndex(
 	deviceIdx: number,
 	featureCode: number,
 ): Promise<number> {
+	const label = `device=0x${deviceIdx.toString(16).padStart(2, "0")} feat=0x${featureCode.toString(16).padStart(4, "0")}`;
 	const hi = (featureCode >> 8) & 0xFF;
 	const lo = featureCode & 0xFF;
 	try {
@@ -137,39 +92,108 @@ async function queryFeatureIndex(
 					data[1] === deviceIdx &&
 					data[2] === 0x00
 				) {
+					logger.info(`Root.getFeature(${label}) → tableIdx=0x${data[4].toString(16)}`);
 					return data[4];
 				}
 			}
 		}
+		logger.warn(`Root.getFeature(${label}) → timeout`);
 	} catch (e) {
-		logger.error(`queryFeatureIndex(0x${deviceIdx.toString(16)}, 0x${featureCode.toString(16)}): ${e}`);
+		logger.error(`Root.getFeature(${label}): ${e}`);
 	}
 	return 0;
 }
 
 /**
- * Dynamically discover which Logi Bolt device slot is the mouse and which is
- * the keyboard by probing for the SmartShift (0x2100) feature — present only
- * on MX Master mice.  Falls back to hardcoded defaults if detection fails.
+ * Discover per-device slot assignments and UnifiedBattery feature indices.
+ *
+ * Strategy:
+ *   1. For each slot, discover the UnifiedBattery feature table index via
+ *      Root.getFeature(0x1004).  Different devices can have different layouts.
+ *   2. Identify the mouse by probing for SmartShift (0x2100) — exclusive to
+ *      MX Master mice.  The other slot is the keyboard.
  */
-async function discoverDeviceIndices(
+async function discoverDevices(
 	writeDev: HIDAsync,
 	readDevs: HIDAsync[],
-): Promise<{ mouse: number; keyboard: number }> {
+): Promise<{ mouse: DeviceConfig; keyboard: DeviceConfig }> {
+	// Step 1 — discover UnifiedBattery feature index per slot
+	const slotFeatureIdx: Record<number, number> = {};
+	for (const idx of [0x01, 0x02]) {
+		const fi = await queryFeatureIndex(writeDev, readDevs, idx, UNIFIED_BATTERY_FEATURE);
+		slotFeatureIdx[idx] = fi > 0 ? fi : FALLBACK_FEATURE_IDX;
+	}
+
+	// Step 2 — identify mouse by SmartShift presence
+	for (const idx of [0x01, 0x02]) {
+		const ssIdx = await queryFeatureIndex(writeDev, readDevs, idx, SMART_SHIFT_FEATURE);
+		if (ssIdx > 0) {
+			const other = idx === 0x01 ? 0x02 : 0x01;
+			const mouse:    DeviceConfig = { idx,   featureIdx: slotFeatureIdx[idx] };
+			const keyboard: DeviceConfig = { idx: other, featureIdx: slotFeatureIdx[other] };
+			logger.info(
+				`Discovered: mouse=slot 0x${idx.toString(16)} (battFeat=0x${mouse.featureIdx.toString(16)}), ` +
+				`keyboard=slot 0x${other.toString(16)} (battFeat=0x${keyboard.featureIdx.toString(16)})`,
+			);
+			return { mouse, keyboard };
+		}
+	}
+
+	logger.warn("SmartShift not found on any slot — using defaults (mouse=0x02 feat=0x08, keyboard=0x01 feat=0x08)");
+	return {
+		mouse:    { idx: 0x02, featureIdx: FALLBACK_FEATURE_IDX },
+		keyboard: { idx: 0x01, featureIdx: FALLBACK_FEATURE_IDX },
+	};
+}
+
+/**
+ * Query battery percentage for one device.
+ *
+ * @param writeDev   Device handle for sending commands (Col01 / macOS path).
+ * @param readDevs   ALL open handles to read from (Col01+Col02 on Windows).
+ * @param deviceIdx  Logi Bolt slot index.
+ * @param featureIdx Feature table index for UnifiedBattery on this device.
+ */
+async function queryBattery(
+	writeDev: HIDAsync,
+	readDevs: HIDAsync[],
+	deviceIdx: number,
+	featureIdx: number,
+): Promise<number> {
+	const label = `slot=0x${deviceIdx.toString(16).padStart(2, "0")} feat=0x${featureIdx.toString(16).padStart(2, "0")}`;
 	try {
-		for (const idx of [0x01, 0x02]) {
-			const featIdx = await queryFeatureIndex(writeDev, readDevs, idx, SMART_SHIFT_FEATURE);
-			if (featIdx > 0) {
-				const other = idx === 0x01 ? 0x02 : 0x01;
-				logger.info(`Discovered: mouse=0x${idx.toString(16)}, keyboard=0x${other.toString(16)}`);
-				return { mouse: idx, keyboard: other };
+		await writeDev.write([0x10, deviceIdx, featureIdx, 0x11, 0x00, 0x00, 0x00]);
+		logger.info(`Sent battery query for ${label}`);
+
+		const deadline = Date.now() + QUERY_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			const remaining = Math.min(deadline - Date.now(), 300);
+			if (remaining <= 0) break;
+
+			// Read from ALL open paths in parallel — on Windows the matching response
+			// arrives on Col02, not Col01, so we must check every path.
+			const results = await Promise.all(readDevs.map(dev => dev.read(remaining)));
+
+			for (const data of results) {
+				if (
+					data !== undefined &&
+					data.length > 4 &&
+					(data[0] === 0x10 || data[0] === 0x11) &&
+					data[1] === deviceIdx &&
+					data[2] === featureIdx
+				) {
+					logger.info(`${label} → ${data[4]}%`);
+					return data[4];
+				}
 			}
 		}
+
+		logger.warn(`No response for ${label} within ${QUERY_TIMEOUT_MS} ms`);
+		return -1;
 	} catch (e) {
-		logger.error(`Device discovery error: ${e}`);
+		logger.error(`Battery query error for ${label}: ${e}`);
+		return -1;
 	}
-	logger.warn("Could not auto-detect device indices — using defaults (mouse=0x02, keyboard=0x01)");
-	return { ...DEVICE_IDX };
 }
 
 async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
@@ -192,11 +216,11 @@ async function pollAllBatteries(): Promise<Record<BatteryDevice, number>> {
 	const writeDev = opened[0];
 
 	try {
-		if (!cachedDeviceIdx) {
-			cachedDeviceIdx = await discoverDeviceIndices(writeDev, opened);
+		if (!cachedDevices) {
+			cachedDevices = await discoverDevices(writeDev, opened);
 		}
-		const mouse    = await queryBattery(writeDev, opened, cachedDeviceIdx.mouse);
-		const keyboard = await queryBattery(writeDev, opened, cachedDeviceIdx.keyboard);
+		const mouse    = await queryBattery(writeDev, opened, cachedDevices.mouse.idx,    cachedDevices.mouse.featureIdx);
+		const keyboard = await queryBattery(writeDev, opened, cachedDevices.keyboard.idx, cachedDevices.keyboard.featureIdx);
 		return { mouse, keyboard };
 	} finally {
 		for (const dev of opened) await dev.close().catch(() => {});
